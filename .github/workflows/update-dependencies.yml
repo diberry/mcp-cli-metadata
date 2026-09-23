@@ -1,0 +1,81 @@
+name: Update dependencies and snapshot
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-dependencies
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install current dependencies
+        run: npm ci
+
+      - name: Update production dependencies
+        id: dependencies
+        shell: bash
+        run: |
+          while IFS= read -r dependency; do
+            latest="$(npm view "$dependency" dist-tags.latest)"
+            npm install --save-exact --package-lock-only "$dependency@$latest"
+          done < <(node -e "for (const name of Object.keys(require('./package.json').dependencies ?? {})) console.log(name)")
+
+          if git diff --quiet -- package.json package-lock.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install updated dependencies
+        if: steps.dependencies.outputs.changed == 'true'
+        run: npm ci
+
+      - name: Create version snapshot
+        if: steps.dependencies.outputs.changed == 'true'
+        run: npm run snapshot
+
+      - name: Run tests
+        if: steps.dependencies.outputs.changed == 'true'
+        run: npm test
+
+      - name: Create and merge pull request
+        if: steps.dependencies.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          branch="automation/update-dependencies-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          version="$(node -p "require('./package.json').dependencies['@azure/mcp']")"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add package.json package-lock.json tracked-version.txt \
+            '[0-9]*.[0-9]*.[0-9]*-*+*'
+          git commit -m "Update Azure MCP CLI metadata to ${version}"
+          git push --set-upstream origin "$branch"
+
+          pr_url="$(gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Update Azure MCP CLI metadata to ${version}" \
+            --body "Automated nightly dependency update and CLI metadata snapshot.")"
+          gh pr merge "$pr_url" --squash --delete-branch
